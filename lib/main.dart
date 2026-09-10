@@ -28,9 +28,16 @@ class EggedLiveCockpit extends StatefulWidget {
 class _EggedLiveCockpitState extends State<EggedLiveCockpit> {
   MapboxMap? mapboxMap;
   double _currentSpeed = 0.0;
+  geo.Position? _currentPos;
+  double _currentBearing = 0.0;
   StreamSubscription<geo.Position>? _positionStream;
   final String token =
       "pk.eyJ1Ijoib2ZlcjY0IiwiYSI6ImNtbnR2NnFuZDA4bzQydHIxbnJjaWo0amoifQ.P3zTYWAbT8SYR8rjz9QYdQ";
+  PointAnnotationManager? _annotationManager;
+
+  // נקודת תרגול בשוהם (רחוב המצפה)
+  final double trainingLat = 31.9515;
+  final double trainingLon = 34.9458;
 
   @override
   void initState() {
@@ -39,69 +46,139 @@ class _EggedLiveCockpitState extends State<EggedLiveCockpit> {
   }
 
   void _startTracking() async {
-    await geo.Geolocator.requestPermission();
+    bool serviceEnabled = await geo.Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) return;
+
+    geo.LocationPermission permission = await geo.Geolocator.checkPermission();
+    if (permission == geo.LocationPermission.denied) {
+      permission = await geo.Geolocator.requestPermission();
+      if (permission == geo.LocationPermission.denied) return;
+    }
+
     _positionStream =
         geo.Geolocator.getPositionStream(
           locationSettings: const geo.LocationSettings(
             accuracy: geo.LocationAccuracy.bestForNavigation,
           ),
         ).listen((pos) {
-          if (mounted) setState(() => _currentSpeed = pos.speed * 3.6);
+          if (mounted) {
+            setState(() {
+              _currentSpeed = pos.speed * 3.6;
+              _currentBearing = pos.heading;
+              _currentPos = pos;
+            });
+            _updateBusIcon(pos.latitude, pos.longitude, pos.heading);
+          }
         });
   }
 
-  Future<void> _apply3D() async {
+  void _updateBusIcon(double lat, double lon, double bearing) async {
+    if (mapboxMap == null) return;
+    _annotationManager ??= await mapboxMap?.annotations
+        .createPointAnnotationManager();
+    await _annotationManager?.deleteAll();
+
+    _annotationManager?.create(
+      PointAnnotationOptions(
+        geometry: Point(coordinates: Position(lon, lat)),
+        iconImage: "bus",
+        iconSize: 1.0,
+        iconRotate: bearing,
+        iconColor: 0xFF2ECC71.toInt(),
+      ),
+    );
+  }
+
+  Future<void> _applyStyle() async {
+    if (mapboxMap == null) return;
+    final style = mapboxMap!.style;
+
     try {
-      await mapboxMap?.style.addSource(
-        VectorSource(id: "composite", url: "mapbox://mapbox.mapbox-streets-v8"),
-      );
-      await mapboxMap?.style.addLayer(
+      // תלת ממד חכם (כחול לגבוהים, בטון לנמוכים)
+      if (await style.styleLayerExists("3d-buildings"))
+        await style.removeStyleLayer("3d-buildings");
+      await style.addLayer(
         FillExtrusionLayer(
           id: "3d-buildings",
           sourceId: "composite",
           sourceLayer: "building",
-          minZoom: 15.0,
-          // התיקון הסופי: מספרים קבועים (double) במקום נוסחה כדי לעבור 100% נקי
-          fillExtrusionHeight: 35.0,
-          fillExtrusionBase: 0.0,
-          fillExtrusionColor: 0xCCD3D3D3,
-          fillExtrusionOpacity: 0.8,
+          fillExtrusionOpacity: 0.85,
         ),
       );
-    } catch (e) {
-      debugPrint(e.toString());
-    }
+
+      await style.setStyleLayerProperty(
+        "3d-buildings",
+        "fill-extrusion-color",
+        [
+          "interpolate",
+          ["linear"],
+          ["get", "height"],
+          0,
+          "#EAE6DA",
+          25,
+          "#EAE6DA",
+          50,
+          "#82B1FF",
+          100,
+          "#2979FF",
+        ],
+      );
+      await style.setStyleLayerProperty(
+        "3d-buildings",
+        "fill-extrusion-height",
+        ["get", "height"],
+      );
+
+      // עברית ופירוט רחובות
+      final layers = ["road-label", "poi-label", "place-neighborhood-label"];
+      for (var l in layers) {
+        if (await style.styleLayerExists(l)) {
+          await style.setStyleLayerProperty(l, "text-field", [
+            "coalesce",
+            ["get", "name_he"],
+            ["get", "name"],
+          ]);
+          await style.setStyleLayerProperty(l, "text-size", 13.5);
+          await style.setStyleLayerProperty(l, "text-padding", 2.0);
+        }
+      }
+    } catch (e) {}
+    _drawRoute();
   }
 
   Future<void> _drawRoute() async {
-    const waypoints = "34.8647,32.1035;34.8621,32.1023;34.8510,32.0925";
+    if (mapboxMap == null) return;
+    // מסלול בשוהם לתרגול
     final url =
-        "https://api.mapbox.com/directions/v5/mapbox/driving/$waypoints?geometries=geojson&overview=full&access_token=$token";
-
+        "https://api.mapbox.com/directions/v5/mapbox/driving/$trainingLon,$trainingLat;34.9422,31.9442?geometries=geojson&overview=full&access_token=$token";
     try {
-      final response = await http.get(Uri.parse(url));
-      if (response.statusCode == 200) {
-        final route = json.decode(response.body)['routes'][0]['geometry'];
-        await mapboxMap?.style.addSource(
+      final res = await http.get(Uri.parse(url));
+      if (res.statusCode == 200) {
+        final data = json.decode(res.body);
+        final geometry = data['routes'][0]['geometry'];
+        final style = mapboxMap!.style;
+        if (await style.styleSourceExists("route-source")) {
+          await style.removeStyleLayer("route-layer");
+          await style.removeStyleSource("route-source");
+        }
+        await style.addSource(
           GeoJsonSource(
-            id: "s",
-            data: json.encode({"type": "Feature", "geometry": route}),
+            id: "route-source",
+            data: json.encode({"type": "Feature", "geometry": geometry}),
           ),
         );
-        await mapboxMap?.style.addLayer(
+        await style.addLayer(
           LineLayer(
-            id: "l",
-            sourceId: "s",
-            lineColor: 0xFFFFD700,
+            id: "route-layer",
+            sourceId: "route-source",
+            lineColor: 0xFFAA00FF.toInt(),
             lineWidth: 8.0,
             lineCap: LineCap.ROUND,
-            lineJoin: LineJoin.ROUND,
           ),
         );
       }
-    } catch (e) {
-      debugPrint(e.toString());
-    }
+    } catch (e) {}
+    _updateBusIcon(trainingLat, trainingLon, 0.0);
   }
 
   @override
@@ -110,62 +187,63 @@ class _EggedLiveCockpitState extends State<EggedLiveCockpit> {
       body: Stack(
         children: [
           MapWidget(
-            key: const ValueKey("m"),
-            styleUri: MapboxStyles.LIGHT,
+            key: const ValueKey("v35"),
+            styleUri: MapboxStyles.MAPBOX_STREETS,
             onMapCreated: (c) {
               mapboxMap = c;
               mapboxMap?.setCamera(
                 CameraOptions(
-                  center: Point(coordinates: Position(34.8647, 32.1035)),
+                  center: Point(
+                    coordinates: Position(trainingLon, trainingLat),
+                  ),
                   zoom: 17.5,
-                  pitch: 70.0,
+                  pitch: 65.0,
                 ),
               );
-              Timer(const Duration(seconds: 2), () {
-                _apply3D();
-                _drawRoute();
-              });
+              Future.delayed(const Duration(seconds: 2), _applyStyle);
             },
           ),
-          Positioned(bottom: 40, left: 20, right: 20, child: _buildDashboard()),
+          // לוח מחוונים צף בסטייל "זכוכית"
+          Positioned(
+            bottom: 30,
+            left: 20,
+            right: 20,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(20),
+              child: BackdropFilter(
+                filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                child: Container(
+                  padding: const EdgeInsets.all(20),
+                  color: Colors.white.withOpacity(0.85),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      _stat(_currentSpeed.toStringAsFixed(0), "קמ\"ש"),
+                      _stat("500", "קו שוהם"),
+                      _stat("המצפה", "תחנה"),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildDashboard() {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(30),
-      child: BackdropFilter(
-        filter: ui.ImageFilter.blur(sigmaX: 15, sigmaY: 15),
-        child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 20),
-          decoration: BoxDecoration(
-            color: const Color(0x99000000),
-            borderRadius: BorderRadius.circular(30),
-            border: Border.all(color: Colors.white10),
-          ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceAround,
-            children: [
-              _stat(_currentSpeed.toStringAsFixed(0), "קמ\"ש", Colors.white),
-              _stat("947", "קו", const Color(0xFFFFD700)),
-              _stat("חיפה", "יעד", const Color(0xFF2ECC71)),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _stat(String v, String l, Color c) => Column(
+  Widget _stat(String val, String label) => Column(
     mainAxisSize: MainAxisSize.min,
     children: [
       Text(
-        v,
-        style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: c),
+        val,
+        style: const TextStyle(
+          fontSize: 26,
+          fontWeight: FontWeight.bold,
+          color: Colors.black87,
+        ),
       ),
-      Text(l, style: const TextStyle(fontSize: 12, color: Colors.white54)),
+      Text(label, style: const TextStyle(fontSize: 10, color: Colors.black54)),
     ],
   );
 
